@@ -1,645 +1,717 @@
-#!/usr/bin/env python3
-"""
-Complete OCR Job Matching System
-Features:
-- Multi-OCR engine support (PaddleOCR, EasyOCR, TrOCR)
-- Document parsing (Resume, CV, Invoices, Cheques, etc.)
-- Job description matching with scoring
-- Skills extraction and competency mapping
-- Local LLM integration (Ollama Llama3.2:3b)
-- FastAPI with Swagger documentation
-"""
-
 import os
 import json
 import re
-import asyncio
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 from datetime import datetime
-from pathlib import Path
 import logging
+from pathlib import Path
 
 # Core libraries
 import numpy as np
 import pandas as pd
 from PIL import Image
 import cv2
+import pytesseract
+from pdf2image import convert_from_path
 
-# OCR libraries
-import easyocr
-import paddleocr
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+# Hugging Face transformers
+from transformers import (
+    TrOCRProcessor, 
+    VisionEncoderDecoderModel,
+    AutoTokenizer,
+    AutoModel,
+    pipeline
+)
+import torch
 
-# NLP and ML
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import spacy
-from fuzzywuzzy import fuzz, process
-
-# API Framework
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+# FastAPI and Swagger
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
-# Ollama client
-import requests
+# NLP and similarity
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import spacy
 
-# Configure logging
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class OCRConfig:
-    """Configuration for OCR engines"""
-    def __init__(self):
-        self.easyocr_langs = ['en']
-        self.paddleocr_lang = 'en'
-        self.trocr_model = 'microsoft/trocr-base-printed'
-        self.device = 'cpu'  # Change to 'cuda' if GPU available
-
-class DocumentTypes:
-    """Supported document types"""
-    RESUME = "resume"
-    CV = "cv"
-    MARKSHEET = "marksheet"
-    INVOICE = "invoice"
-    CHEQUE = "cheque"
-    CHALLAN = "challan"
-    HANDWRITTEN = "handwritten"
-    GENERAL = "general"
-
-class JobDescriptions:
-    """Sample Python job descriptions"""
-    @staticmethod
-    def get_python_jobs():
-        return [
-            {
-                "id": 1,
-                "title": "Senior Python Developer - Full Stack",
-                "company": "TechCorp Solutions",
-                "location": "Bangalore, India",
-                "experience": "5-8 years",
-                "skills": [
-                    "Python", "Django", "Flask", "FastAPI", "React", "JavaScript",
-                    "PostgreSQL", "Redis", "Docker", "AWS", "Git", "REST APIs",
-                    "GraphQL", "Celery", "pytest", "Linux"
-                ],
-                "soft_skills": ["Problem solving", "Team leadership", "Communication", "Agile methodology"],
-                "tools": ["PyCharm", "VS Code", "Jira", "Jenkins", "GitHub Actions"],
-                "requirements": [
-                    "5+ years Python development experience",
-                    "Strong knowledge of web frameworks",
-                    "Experience with cloud platforms",
-                    "Database design and optimization",
-                    "API development and integration"
-                ],
-                "responsibilities": [
-                    "Lead development of scalable web applications",
-                    "Mentor junior developers",
-                    "Architecture design and code reviews",
-                    "Performance optimization"
-                ]
-            },
-            {
-                "id": 2,
-                "title": "Python Data Engineer",
-                "company": "DataFlow Analytics",
-                "location": "Mumbai, India",
-                "experience": "3-6 years",
-                "skills": [
-                    "Python", "Apache Spark", "Hadoop", "Kafka", "Airflow",
-                    "SQL", "NoSQL", "ETL", "Pandas", "NumPy", "Docker",
-                    "Kubernetes", "AWS", "GCP", "Snowflake"
-                ],
-                "soft_skills": ["Analytical thinking", "Attention to detail", "Collaboration"],
-                "tools": ["Databricks", "Tableau", "Power BI", "Jupyter", "Git"],
-                "requirements": [
-                    "Strong Python programming skills",
-                    "Experience with big data technologies",
-                    "ETL pipeline development",
-                    "Cloud platform experience"
-                ],
-                "responsibilities": [
-                    "Design and maintain data pipelines",
-                    "Optimize data processing workflows",
-                    "Collaborate with data scientists",
-                    "Ensure data quality and governance"
-                ]
-            },
-            {
-                "id": 3,
-                "title": "Python Machine Learning Engineer",
-                "company": "AI Innovations Ltd",
-                "location": "Hyderabad, India",
-                "experience": "4-7 years",
-                "skills": [
-                    "Python", "scikit-learn", "TensorFlow", "PyTorch", "Keras",
-                    "MLflow", "Kubeflow", "Docker", "Kubernetes", "AWS SageMaker",
-                    "Pandas", "NumPy", "Matplotlib", "Seaborn", "SQL"
-                ],
-                "soft_skills": ["Research mindset", "Problem solving", "Communication"],
-                "tools": ["Jupyter", "MLflow", "Weights & Biases", "Git", "DVC"],
-                "requirements": [
-                    "Strong ML algorithms knowledge",
-                    "Model deployment experience",
-                    "Statistical analysis skills",
-                    "MLOps practices"
-                ],
-                "responsibilities": [
-                    "Develop and deploy ML models",
-                    "Model performance monitoring",
-                    "Research new ML techniques",
-                    "Collaborate with product teams"
-                ]
-            },
-            {
-                "id": 4,
-                "title": "Python Backend Developer",
-                "company": "CloudTech Systems",
-                "location": "Pune, India",
-                "experience": "2-5 years",
-                "skills": [
-                    "Python", "FastAPI", "Django", "Flask", "SQLAlchemy",
-                    "PostgreSQL", "MongoDB", "Redis", "RabbitMQ", "Docker",
-                    "AWS", "Elasticsearch", "pytest", "Git"
-                ],
-                "soft_skills": ["Team collaboration", "Problem solving", "Time management"],
-                "tools": ["PyCharm", "Postman", "Docker", "Jenkins", "Grafana"],
-                "requirements": [
-                    "Strong Python fundamentals",
-                    "RESTful API development",
-                    "Database design skills",
-                    "Testing methodologies"
-                ],
-                "responsibilities": [
-                    "Develop robust backend services",
-                    "API design and implementation",
-                    "Database optimization",
-                    "Code reviews and testing"
-                ]
-            },
-            {
-                "id": 5,
-                "title": "Python DevOps Engineer",
-                "company": "InfraTech Solutions",
-                "location": "Chennai, India",
-                "experience": "3-6 years",
-                "skills": [
-                    "Python", "Bash", "Terraform", "Ansible", "Docker",
-                    "Kubernetes", "AWS", "Azure", "Jenkins", "GitLab CI",
-                    "Monitoring", "Logging", "Prometheus", "Grafana"
-                ],
-                "soft_skills": ["System thinking", "Troubleshooting", "Communication"],
-                "tools": ["Jenkins", "Terraform", "Ansible", "Helm", "ArgoCD"],
-                "requirements": [
-                    "Infrastructure automation experience",
-                    "CI/CD pipeline development",
-                    "Cloud platform expertise",
-                    "Monitoring and logging"
-                ],
-                "responsibilities": [
-                    "Automate deployment processes",
-                    "Manage cloud infrastructure",
-                    "Monitor system performance",
-                    "Ensure high availability"
-                ]
-            },
-            {
-                "id": 6,
-                "title": "Python QA Automation Engineer",
-                "company": "QualityFirst Tech",
-                "location": "Noida, India",
-                "experience": "2-4 years",
-                "skills": [
-                    "Python", "Selenium", "pytest", "Robot Framework",
-                    "API Testing", "Postman", "TestNG", "CI/CD", "Git",
-                    "SQL", "Linux", "Docker", "Jenkins"
-                ],
-                "soft_skills": ["Attention to detail", "Analytical thinking", "Communication"],
-                "tools": ["Selenium Grid", "Allure", "JIRA", "TestRail", "BrowserStack"],
-                "requirements": [
-                    "Test automation framework development",
-                    "API and UI testing experience",
-                    "Bug tracking and reporting",
-                    "Continuous integration"
-                ],
-                "responsibilities": [
-                    "Design test automation frameworks",
-                    "Execute automated test suites",
-                    "Bug reporting and tracking",
-                    "Performance testing"
-                ]
-            },
-            {
-                "id": 7,
-                "title": "Python Blockchain Developer",
-                "company": "CryptoTech Innovations",
-                "location": "Bangalore, India",
-                "experience": "3-5 years",
-                "skills": [
-                    "Python", "Solidity", "Web3.py", "Ethereum", "Smart Contracts",
-                    "DeFi", "IPFS", "Blockchain", "Cryptography", "Django",
-                    "PostgreSQL", "Docker", "AWS"
-                ],
-                "soft_skills": ["Innovation", "Security mindset", "Research skills"],
-                "tools": ["Truffle", "Hardhat", "MetaMask", "Remix", "Ganache"],
-                "requirements": [
-                    "Blockchain technology understanding",
-                    "Smart contract development",
-                    "Cryptocurrency knowledge",
-                    "Security best practices"
-                ],
-                "responsibilities": [
-                    "Develop blockchain applications",
-                    "Smart contract implementation",
-                    "DApp frontend integration",
-                    "Security auditing"
-                ]
-            },
-            {
-                "id": 8,
-                "title": "Python Game Developer",
-                "company": "GameStudio Pro",
-                "location": "Mumbai, India",
-                "experience": "2-5 years",
-                "skills": [
-                    "Python", "Pygame", "Unity3D", "C#", "Blender",
-                    "3D Graphics", "Game Physics", "AI", "Networking",
-                    "Git", "Agile", "Mobile Development"
-                ],
-                "soft_skills": ["Creativity", "Team collaboration", "Problem solving"],
-                "tools": ["Unity", "Blender", "Photoshop", "JIRA", "Perforce"],
-                "requirements": [
-                    "Game development experience",
-                    "3D graphics knowledge",
-                    "Physics simulation",
-                    "Multi-platform development"
-                ],
-                "responsibilities": [
-                    "Develop game mechanics",
-                    "Implement AI systems",
-                    "Performance optimization",
-                    "Cross-platform compatibility"
-                ]
-            },
-            {
-                "id": 9,
-                "title": "Python Security Engineer",
-                "company": "SecureNet Solutions",
-                "location": "Delhi, India",
-                "experience": "4-7 years",
-                "skills": [
-                    "Python", "Cybersecurity", "Penetration Testing", "OWASP",
-                    "Cryptography", "Network Security", "Vulnerability Assessment",
-                    "Linux", "Docker", "AWS Security", "SIEM"
-                ],
-                "soft_skills": ["Ethical mindset", "Analytical thinking", "Communication"],
-                "tools": ["Metasploit", "Nmap", "Wireshark", "Burp Suite", "Splunk"],
-                "requirements": [
-                    "Security testing experience",
-                    "Vulnerability assessment skills",
-                    "Compliance knowledge",
-                    "Incident response"
-                ],
-                "responsibilities": [
-                    "Conduct security assessments",
-                    "Develop security tools",
-                    "Monitor security incidents",
-                    "Security training and awareness"
-                ]
-            },
-            {
-                "id": 10,
-                "title": "Python Research Engineer",
-                "company": "Research Labs India",
-                "location": "Hyderabad, India",
-                "experience": "3-6 years",
-                "skills": [
-                    "Python", "Research", "Statistics", "Mathematics",
-                    "Machine Learning", "Deep Learning", "NLP", "Computer Vision",
-                    "Publications", "Patents", "Jupyter", "Git"
-                ],
-                "soft_skills": ["Research mindset", "Innovation", "Presentation skills"],
-                "tools": ["Jupyter", "LaTeX", "Research databases", "Git", "Docker"],
-                "requirements": [
-                    "Advanced degree preferred",
-                    "Research publication experience",
-                    "Algorithm development",
-                    "Statistical analysis"
-                ],
-                "responsibilities": [
-                    "Conduct cutting-edge research",
-                    "Publish research papers",
-                    "Develop novel algorithms",
-                    "Collaborate with academia"
-                ]
-            }
-        ]
-
-class OCREngine:
-    """Multi-engine OCR system"""
+class DocumentProcessor:
+    """Advanced OCR processor using multiple Hugging Face models"""
     
     def __init__(self):
-        self.config = OCRConfig()
-        self.easy_reader = None
-        self.paddle_ocr = None
-        self.trocr_processor = None
-        self.trocr_model = None
-        self._initialize_engines()
-    
-    def _initialize_engines(self):
-        """Initialize OCR engines"""
+        self.setup_models()
+        self.setup_nlp()
+        
+    def setup_models(self):
+        """Initialize all required models locally"""
         try:
-            # Initialize EasyOCR
-            self.easy_reader = easyocr.Reader(self.config.easyocr_langs)
-            logger.info("EasyOCR initialized successfully")
+            # TrOCR for handwritten and printed text
+            self.trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
+            self.trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
             
-            # Initialize PaddleOCR
-            self.paddle_ocr = paddleocr.PaddleOCR(
-                use_angle_cls=True,
-                lang=self.config.paddleocr_lang,
-                use_gpu=False
-            )
-            logger.info("PaddleOCR initialized successfully")
+            # For handwritten text
+            self.trocr_hw_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-handwritten")
+            self.trocr_hw_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-handwritten")
             
-            # Initialize TrOCR
-            self.trocr_processor = TrOCRProcessor.from_pretrained(self.config.trocr_model)
-            self.trocr_model = VisionEncoderDecoderModel.from_pretrained(self.config.trocr_model)
-            logger.info("TrOCR initialized successfully")
+            # Sentence transformer for semantic similarity
+            self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+            
+            # NER pipeline for entity extraction
+            self.ner_pipeline = pipeline("ner", 
+                                       model="dbmdz/bert-large-cased-finetuned-conll03-english",
+                                       aggregation_strategy="simple")
+            
+            logger.info("All models loaded successfully")
             
         except Exception as e:
-            logger.error(f"Error initializing OCR engines: {e}")
+            logger.error(f"Error loading models: {e}")
+            raise
     
-    def extract_text_easyocr(self, image_path: str) -> str:
-        """Extract text using EasyOCR"""
-        try:
-            results = self.easy_reader.readtext(image_path)
-            text = ' '.join([result[1] for result in results])
-            return text
-        except Exception as e:
-            logger.error(f"EasyOCR error: {e}")
-            return ""
-    
-    def extract_text_paddleocr(self, image_path: str) -> str:
-        """Extract text using PaddleOCR"""
-        try:
-            results = self.paddle_ocr.ocr(image_path, cls=True)
-            text_parts = []
-            for line in results:
-                if line:
-                    for item in line:
-                        if len(item) > 1:
-                            text_parts.append(item[1][0])
-            return ' '.join(text_parts)
-        except Exception as e:
-            logger.error(f"PaddleOCR error: {e}")
-            return ""
-    
-    def extract_text_trocr(self, image_path: str) -> str:
-        """Extract text using TrOCR"""
-        try:
-            image = Image.open(image_path).convert('RGB')
-            pixel_values = self.trocr_processor(images=image, return_tensors="pt").pixel_values
-            generated_ids = self.trocr_model.generate(pixel_values)
-            generated_text = self.trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            return generated_text
-        except Exception as e:
-            logger.error(f"TrOCR error: {e}")
-            return ""
-    
-    def extract_text_multi_engine(self, image_path: str, doc_type: str = DocumentTypes.GENERAL) -> Dict[str, Any]:
-        """Extract text using multiple OCR engines and combine results"""
-        results = {}
-        
-        # Get results from all engines
-        results['easyocr'] = self.extract_text_easyocr(image_path)
-        results['paddleocr'] = self.extract_text_paddleocr(image_path)
-        results['trocr'] = self.extract_text_trocr(image_path)
-        
-        # Choose best result based on document type and text length
-        best_text = self._select_best_ocr_result(results, doc_type)
-        
-        return {
-            'all_results': results,
-            'best_result': best_text,
-            'confidence_scores': self._calculate_confidence_scores(results)
-        }
-    
-    def _select_best_ocr_result(self, results: Dict[str, str], doc_type: str) -> str:
-        """Select the best OCR result based on document type and quality metrics"""
-        # Simple heuristic: choose the longest non-empty result
-        valid_results = {k: v for k, v in results.items() if v.strip()}
-        
-        if not valid_results:
-            return ""
-        
-        # For different document types, prefer different engines
-        if doc_type == DocumentTypes.HANDWRITTEN:
-            # TrOCR is better for handwritten text
-            if results['trocr'].strip():
-                return results['trocr']
-        elif doc_type in [DocumentTypes.INVOICE, DocumentTypes.CHEQUE, DocumentTypes.CHALLAN]:
-            # PaddleOCR is often better for structured documents
-            if results['paddleocr'].strip():
-                return results['paddleocr']
-        
-        # Default: return the longest result
-        return max(valid_results.items(), key=lambda x: len(x[1]))[1]
-    
-    def _calculate_confidence_scores(self, results: Dict[str, str]) -> Dict[str, float]:
-        """Calculate confidence scores for OCR results"""
-        scores = {}
-        for engine, text in results.items():
-            # Simple confidence based on text length and character diversity
-            if not text.strip():
-                scores[engine] = 0.0
-            else:
-                # Basic confidence calculation
-                length_score = min(len(text) / 100, 1.0)  # Normalize by expected length
-                char_diversity = len(set(text.lower())) / max(len(text), 1)
-                scores[engine] = (length_score + char_diversity) / 2
-        
-        return scores
-
-class TextProcessor:
-    """Advanced text processing and information extraction"""
-    
-    def __init__(self):
-        # Load spaCy model (download with: python -m spacy download en_core_web_sm)
+    def setup_nlp(self):
+        """Setup NLP components"""
         try:
             self.nlp = spacy.load("en_core_web_sm")
         except OSError:
             logger.warning("spaCy model not found. Install with: python -m spacy download en_core_web_sm")
             self.nlp = None
-        
-        # Common skills database
-        self.technical_skills = [
-            "Python", "Java", "JavaScript", "C++", "C#", "Go", "Rust", "Ruby", "PHP", "Swift",
-            "Django", "Flask", "FastAPI", "React", "Vue.js", "Angular", "Node.js", "Express",
-            "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Elasticsearch",
-            "Docker", "Kubernetes", "AWS", "Azure", "GCP", "Terraform", "Ansible",
-            "Git", "Jenkins", "CI/CD", "Linux", "REST API", "GraphQL", "Machine Learning",
-            "Deep Learning", "TensorFlow", "PyTorch", "scikit-learn", "Pandas", "NumPy"
-        ]
-        
-        self.soft_skills = [
-            "Leadership", "Communication", "Problem solving", "Team collaboration",
-            "Time management", "Adaptability", "Critical thinking", "Creativity",
-            "Project management", "Agile", "Scrum", "Public speaking", "Negotiation"
-        ]
     
-    def extract_skills(self, text: str) -> Dict[str, List[str]]:
-        """Extract technical and soft skills from text"""
-        text_lower = text.lower()
+    def preprocess_image(self, image_path: str) -> Image.Image:
+        """Preprocess image for better OCR results"""
+        image = cv2.imread(image_path)
         
-        # Extract technical skills
-        found_technical = []
-        for skill in self.technical_skills:
-            if skill.lower() in text_lower:
-                found_technical.append(skill)
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Extract soft skills
-        found_soft = []
-        for skill in self.soft_skills:
-            if skill.lower() in text_lower:
-                found_soft.append(skill)
+        # Noise removal
+        denoised = cv2.medianBlur(gray, 5)
         
-        return {
-            "technical_skills": found_technical,
-            "soft_skills": found_soft
+        # Thresholding
+        _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        return Image.fromarray(thresh)
+    
+    def extract_text_trocr(self, image: Image.Image, handwritten: bool = False) -> str:
+        """Extract text using TrOCR models"""
+        try:
+            if handwritten:
+                pixel_values = self.trocr_hw_processor(image, return_tensors="pt").pixel_values
+                generated_ids = self.trocr_hw_model.generate(pixel_values)
+                generated_text = self.trocr_hw_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            else:
+                pixel_values = self.trocr_processor(image, return_tensors="pt").pixel_values
+                generated_ids = self.trocr_model.generate(pixel_values)
+                generated_text = self.trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            
+            return generated_text
+        except Exception as e:
+            logger.error(f"TrOCR extraction failed: {e}")
+            return ""
+    
+    def extract_text_tesseract(self, image: Image.Image) -> str:
+        """Fallback OCR using Tesseract"""
+        try:
+            return pytesseract.image_to_string(image, config='--psm 6')
+        except Exception as e:
+            logger.error(f"Tesseract extraction failed: {e}")
+            return ""
+    
+    def process_document(self, file_path: str, doc_type: str = "auto") -> Dict[str, Any]:
+        """Main document processing function"""
+        result = {
+            "file_path": file_path,
+            "document_type": doc_type,
+            "extracted_text": "",
+            "structured_data": {},
+            "confidence_score": 0.0
         }
+        
+        try:
+            # Handle PDF files
+            if file_path.lower().endswith('.pdf'):
+                pages = convert_from_path(file_path)
+                all_text = []
+                
+                for page in pages:
+                    # Try TrOCR first
+                    text_trocr = self.extract_text_trocr(page)
+                    
+                    # Fallback to Tesseract if TrOCR fails
+                    if not text_trocr.strip():
+                        text_trocr = self.extract_text_tesseract(page)
+                    
+                    all_text.append(text_trocr)
+                
+                result["extracted_text"] = "\n".join(all_text)
+            
+            # Handle image files
+            else:
+                preprocessed_image = self.preprocess_image(file_path)
+                
+                # Determine if handwritten
+                is_handwritten = self.detect_handwriting(preprocessed_image)
+                
+                # Extract text using appropriate model
+                text_trocr = self.extract_text_trocr(preprocessed_image, is_handwritten)
+                
+                # Fallback to Tesseract
+                if not text_trocr.strip():
+                    text_trocr = self.extract_text_tesseract(preprocessed_image)
+                
+                result["extracted_text"] = text_trocr
+            
+            # Parse structured data based on document type
+            result["structured_data"] = self.parse_structured_data(result["extracted_text"], doc_type)
+            result["confidence_score"] = self.calculate_confidence(result["extracted_text"])
+            
+        except Exception as e:
+            logger.error(f"Document processing failed: {e}")
+            result["error"] = str(e)
+        
+        return result
     
-    def extract_experience(self, text: str) -> Dict[str, Any]:
-        """Extract experience information"""
-        # Pattern for experience (e.g., "5 years", "2-3 years", "3+ years")
-        exp_patterns = [
-            r'(\d+)\s*[-+]\s*(\d+)\s*years?',
-            r'(\d+)\+?\s*years?',
-            r'(\d+)\s*to\s*(\d+)\s*years?'
-        ]
-        
-        experiences = []
-        for pattern in exp_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            experiences.extend(matches)
-        
-        return {"experience_mentions": experiences}
+    def detect_handwriting(self, image: Image.Image) -> bool:
+        """Simple handwriting detection (can be improved with ML model)"""
+        # This is a simplified version - in practice, you'd use a classifier
+        # For now, we'll use some basic heuristics
+        return False  # Default to printed text
     
-    def extract_education(self, text: str) -> List[str]:
-        """Extract education information"""
-        education_keywords = [
-            "bachelor", "master", "phd", "doctorate", "diploma", "certificate",
-            "b.tech", "m.tech", "b.sc", "m.sc", "mba", "bca", "mca",
-            "engineering", "computer science", "information technology"
-        ]
+    def parse_structured_data(self, text: str, doc_type: str) -> Dict[str, Any]:
+        """Parse structured data based on document type"""
+        structured_data = {}
         
-        found_education = []
-        text_lower = text.lower()
+        if doc_type in ["resume", "cv"]:
+            structured_data = self.parse_resume(text)
+        elif doc_type == "invoice":
+            structured_data = self.parse_invoice(text)
+        elif doc_type == "marksheet":
+            structured_data = self.parse_marksheet(text)
+        elif doc_type == "cheque":
+            structured_data = self.parse_cheque(text)
+        else:
+            # Auto-detect and parse
+            structured_data = self.auto_parse(text)
         
-        for edu in education_keywords:
-            if edu in text_lower:
-                found_education.append(edu)
-        
-        return found_education
+        return structured_data
     
-    def extract_contact_info(self, text: str) -> Dict[str, Any]:
-        """Extract contact information"""
-        # Email pattern
+    def parse_resume(self, text: str) -> Dict[str, Any]:
+        """Parse resume/CV data"""
+        resume_data = {
+            "personal_info": {},
+            "skills": {"technical": [], "soft": []},
+            "experience": [],
+            "education": [],
+            "achievements": [],
+            "tools_technologies": []
+        }
+        
+        # Extract email
         email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
         emails = re.findall(email_pattern, text)
+        if emails:
+            resume_data["personal_info"]["email"] = emails[0]
         
-        # Phone pattern (Indian format)
-        phone_pattern = r'[\+]?[91]?[-.\s]?[6-9]\d{9}'
+        # Extract phone numbers
+        phone_pattern = r'(\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'
         phones = re.findall(phone_pattern, text)
+        if phones:
+            resume_data["personal_info"]["phone"] = phones[0]
         
-        return {
-            "emails": emails,
-            "phones": phones
-        }
-    
-    def extract_achievements(self, text: str) -> List[str]:
-        """Extract achievements and awards"""
-        achievement_keywords = [
-            "award", "recognition", "achievement", "honor", "certification",
-            "published", "patent", "winner", "recipient", "excellence"
+        # Extract skills using NER and keyword matching
+        if self.ner_pipeline:
+            entities = self.ner_pipeline(text)
+            for entity in entities:
+                if entity['entity_group'] == 'MISC':
+                    resume_data["skills"]["technical"].append(entity['word'])
+        
+        # Common technical skills
+        tech_skills = [
+            'python', 'java', 'javascript', 'react', 'node.js', 'sql', 'mongodb',
+            'docker', 'kubernetes', 'aws', 'azure', 'git', 'tensorflow', 'pytorch',
+            'machine learning', 'data science', 'artificial intelligence'
         ]
         
-        achievements = []
-        sentences = text.split('.')
+        text_lower = text.lower()
+        for skill in tech_skills:
+            if skill in text_lower:
+                resume_data["skills"]["technical"].append(skill.title())
         
-        for sentence in sentences:
-            sentence_lower = sentence.lower()
-            if any(keyword in sentence_lower for keyword in achievement_keywords):
-                achievements.append(sentence.strip())
+        # Extract years of experience
+        exp_pattern = r'(\d+)(?:\+)?\s*(?:years?|yrs?)\s*(?:of\s*)?(?:experience|exp)'
+        exp_matches = re.findall(exp_pattern, text.lower())
+        if exp_matches:
+            resume_data["experience_years"] = max([int(x) for x in exp_matches])
         
-        return achievements
+        return resume_data
+    
+    def parse_invoice(self, text: str) -> Dict[str, Any]:
+        """Parse invoice data"""
+        invoice_data = {
+            "invoice_number": "",
+            "date": "",
+            "amount": "",
+            "vendor": "",
+            "items": []
+        }
+        
+        # Extract invoice number
+        inv_pattern = r'(?:invoice|inv)(?:\s*#|\s*no\.?|\s*number)?\s*:?\s*([A-Z0-9-]+)'
+        inv_match = re.search(inv_pattern, text, re.IGNORECASE)
+        if inv_match:
+            invoice_data["invoice_number"] = inv_match.group(1)
+        
+        # Extract amount
+        amount_pattern = r'(?:total|amount|sum)?\s*:?\s*[$₹€£]?\s*(\d+(?:,\d{3})*(?:\.\d{2})?)'
+        amount_match = re.search(amount_pattern, text, re.IGNORECASE)
+        if amount_match:
+            invoice_data["amount"] = amount_match.group(1)
+        
+        return invoice_data
+    
+    def parse_marksheet(self, text: str) -> Dict[str, Any]:
+        """Parse marksheet/transcript data"""
+        marksheet_data = {
+            "student_name": "",
+            "roll_number": "",
+            "subjects": [],
+            "grades": [],
+            "gpa": "",
+            "percentage": ""
+        }
+        
+        # Extract percentage
+        perc_pattern = r'(\d+(?:\.\d+)?)\s*%'
+        perc_matches = re.findall(perc_pattern, text)
+        if perc_matches:
+            marksheet_data["percentage"] = max(perc_matches)
+        
+        # Extract GPA
+        gpa_pattern = r'(?:gpa|cgpa)\s*:?\s*(\d+\.\d+)'
+        gpa_match = re.search(gpa_pattern, text, re.IGNORECASE)
+        if gpa_match:
+            marksheet_data["gpa"] = gpa_match.group(1)
+        
+        return marksheet_data
+    
+    def parse_cheque(self, text: str) -> Dict[str, Any]:
+        """Parse cheque data"""
+        cheque_data = {
+            "amount_words": "",
+            "amount_figures": "",
+            "payee": "",
+            "date": "",
+            "cheque_number": ""
+        }
+        
+        # Extract amount in figures
+        amount_pattern = r'₹\s*(\d+(?:,\d{3})*(?:\.\d{2})?)'
+        amount_match = re.search(amount_pattern, text)
+        if amount_match:
+            cheque_data["amount_figures"] = amount_match.group(1)
+        
+        return cheque_data
+    
+    def auto_parse(self, text: str) -> Dict[str, Any]:
+        """Auto-detect document type and parse accordingly"""
+        text_lower = text.lower()
+        
+        if any(word in text_lower for word in ['resume', 'cv', 'experience', 'skills']):
+            return self.parse_resume(text)
+        elif any(word in text_lower for word in ['invoice', 'bill', 'amount', 'total']):
+            return self.parse_invoice(text)
+        elif any(word in text_lower for word in ['marks', 'grade', 'percentage', 'gpa']):
+            return self.parse_marksheet(text)
+        elif any(word in text_lower for word in ['pay', 'cheque', 'bank']):
+            return self.parse_cheque(text)
+        else:
+            return {"type": "unknown", "raw_text": text}
+    
+    def calculate_confidence(self, text: str) -> float:
+        """Calculate confidence score based on text quality"""
+        if not text.strip():
+            return 0.0
+        
+        # Simple confidence calculation based on:
+        # - Text length
+        # - Presence of common words
+        # - Character distribution
+        
+        score = 0.0
+        
+        # Length factor
+        if len(text) > 100:
+            score += 0.3
+        elif len(text) > 50:
+            score += 0.2
+        else:
+            score += 0.1
+        
+        # Word count factor
+        words = text.split()
+        if len(words) > 20:
+            score += 0.3
+        elif len(words) > 10:
+            score += 0.2
+        else:
+            score += 0.1
+        
+        # Character variety
+        unique_chars = len(set(text.lower()))
+        if unique_chars > 20:
+            score += 0.4
+        elif unique_chars > 10:
+            score += 0.3
+        else:
+            score += 0.2
+        
+        return min(score, 1.0)
 
 class JobMatcher:
-    """Job matching and scoring system"""
+    """Job matching system with skill analysis"""
     
     def __init__(self):
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-        self.job_descriptions = JobDescriptions.get_python_jobs()
+        self.job_descriptions = self.create_job_descriptions()
     
-    def calculate_skill_match_score(self, cv_skills: List[str], job_skills: List[str]) -> float:
-        """Calculate skill match score between CV and job"""
-        if not cv_skills or not job_skills:
+    def create_job_descriptions(self) -> List[Dict[str, Any]]:
+        """Create 10 diverse Python job descriptions"""
+        jobs = [
+            {
+                "id": 1,
+                "title": "Senior Python Developer",
+                "company": "TechCorp Solutions",
+                "experience": "5-7 years",
+                "location": "Bangalore",
+                "skills": [
+                    "Python", "Django", "Flask", "PostgreSQL", "Redis", "Docker", 
+                    "AWS", "Git", "RESTful APIs", "Microservices"
+                ],
+                "soft_skills": [
+                    "Team Leadership", "Problem Solving", "Communication", 
+                    "Agile Methodology", "Code Review"
+                ],
+                "tools": [
+                    "PyCharm", "Jupyter", "Postman", "Jenkins", "Kubernetes"
+                ],
+                "description": "We are seeking a Senior Python Developer to lead our backend development team. You will be responsible for designing scalable web applications, mentoring junior developers, and implementing best practices in software development.",
+                "requirements": [
+                    "5+ years of Python development experience",
+                    "Strong experience with Django/Flask frameworks",
+                    "Database design and optimization skills",
+                    "Cloud platform experience (AWS/Azure)",
+                    "Leadership and mentoring experience"
+                ]
+            },
+            {
+                "id": 2,
+                "title": "Python Data Scientist",
+                "company": "DataInsights AI",
+                "experience": "3-5 years",
+                "location": "Mumbai",
+                "skills": [
+                    "Python", "Pandas", "NumPy", "Scikit-learn", "TensorFlow", 
+                    "PyTorch", "SQL", "Statistics", "Machine Learning", "Deep Learning"
+                ],
+                "soft_skills": [
+                    "Analytical Thinking", "Research Skills", "Communication", 
+                    "Presentation Skills", "Curiosity"
+                ],
+                "tools": [
+                    "Jupyter", "Apache Spark", "Tableau", "Power BI", "Git"
+                ],
+                "description": "Join our AI team to build cutting-edge machine learning models. You'll work on predictive analytics, natural language processing, and computer vision projects.",
+                "requirements": [
+                    "Strong Python programming skills",
+                    "Experience with ML/DL frameworks",
+                    "Statistical analysis expertise",
+                    "Data visualization skills",
+                    "PhD/Masters in relevant field preferred"
+                ]
+            },
+            {
+                "id": 3,
+                "title": "Python Backend Engineer",
+                "company": "StartupTech",
+                "experience": "2-4 years",
+                "location": "Remote",
+                "skills": [
+                    "Python", "FastAPI", "Django", "MongoDB", "PostgreSQL", 
+                    "Redis", "Celery", "Docker", "Linux", "Git"
+                ],
+                "soft_skills": [
+                    "Self-motivated", "Remote Collaboration", "Problem Solving", 
+                    "Time Management", "Adaptability"
+                ],
+                "tools": [
+                    "VS Code", "Docker", "Postman", "GitHub Actions", "MongoDB Compass"
+                ],
+                "description": "Build robust backend systems for our growing startup. You'll work in a fast-paced environment with modern technologies and agile practices.",
+                "requirements": [
+                    "2+ years Python backend experience",
+                    "API design and development",
+                    "Database management skills",
+                    "Remote work experience",
+                    "Startup mindset"
+                ]
+            },
+            {
+                "id": 4,
+                "title": "Python DevOps Engineer",
+                "company": "CloudFirst Technologies",
+                "experience": "4-6 years",
+                "location": "Hyderabad",
+                "skills": [
+                    "Python", "Ansible", "Terraform", "Docker", "Kubernetes", 
+                    "AWS", "CI/CD", "Jenkins", "Monitoring", "Linux"
+                ],
+                "soft_skills": [
+                    "System Thinking", "Troubleshooting", "Collaboration", 
+                    "Documentation", "Continuous Learning"
+                ],
+                "tools": [
+                    "Jenkins", "GitLab CI", "Prometheus", "Grafana", "ELK Stack"
+                ],
+                "description": "Automate infrastructure and deployment processes using Python. Work closely with development teams to implement DevOps best practices.",
+                "requirements": [
+                    "Strong Python scripting skills",
+                    "Cloud platform experience",
+                    "Infrastructure as Code experience",
+                    "Container orchestration knowledge",
+                    "Monitoring and logging expertise"
+                ]
+            },
+            {
+                "id": 5,
+                "title": "Junior Python Developer",
+                "company": "EduTech Solutions",
+                "experience": "0-2 years",
+                "location": "Pune",
+                "skills": [
+                    "Python", "Django", "HTML", "CSS", "JavaScript", "SQLite", 
+                    "Git", "Bootstrap", "jQuery", "Basic Linux"
+                ],
+                "soft_skills": [
+                    "Eagerness to Learn", "Team Player", "Attention to Detail", 
+                    "Communication", "Patience"
+                ],
+                "tools": [
+                    "VS Code", "Git", "Chrome DevTools", "SQLite Browser"
+                ],
+                "description": "Perfect opportunity for fresh graduates to start their Python development career. You'll work on educational technology projects with mentorship from senior developers.",
+                "requirements": [
+                    "Bachelor's degree in Computer Science",
+                    "Basic Python programming knowledge",
+                    "Understanding of web development basics",
+                    "Good communication skills",
+                    "Willingness to learn"
+                ]
+            },
+            {
+                "id": 6,
+                "title": "Python ML Engineer",
+                "company": "AI Innovations Lab",
+                "experience": "3-5 years",
+                "location": "Chennai",
+                "skills": [
+                    "Python", "TensorFlow", "PyTorch", "MLflow", "Kubernetes", 
+                    "Docker", "Apache Airflow", "SQL", "NoSQL", "Model Deployment"
+                ],
+                "soft_skills": [
+                    "Innovation", "Research Oriented", "Problem Solving", 
+                    "Collaboration", "Technical Communication"
+                ],
+                "tools": [
+                    "MLflow", "Kubeflow", "TensorBoard", "Weights & Biases", "DVC"
+                ],
+                "description": "Deploy and maintain machine learning models in production. Work on MLOps pipelines and model monitoring systems.",
+                "requirements": [
+                    "ML model deployment experience",
+                    "Container and orchestration knowledge",
+                    "ML pipeline development",
+                    "Model monitoring and maintenance",
+                    "Cloud ML platform experience"
+                ]
+            },
+            {
+                "id": 7,
+                "title": "Python Full Stack Developer",
+                "company": "WebSolutions Pro",
+                "experience": "3-5 years",
+                "location": "Delhi",
+                "skills": [
+                    "Python", "Django", "React", "JavaScript", "PostgreSQL", 
+                    "Redis", "HTML5", "CSS3", "RESTful APIs", "GraphQL"
+                ],
+                "soft_skills": [
+                    "Versatility", "UI/UX Awareness", "Client Communication", 
+                    "Project Management", "Creativity"
+                ],
+                "tools": [
+                    "VS Code", "React DevTools", "Postman", "Figma", "Git"
+                ],
+                "description": "Develop end-to-end web applications using Python backend and modern frontend technologies. Work directly with clients on custom solutions.",
+                "requirements": [
+                    "Full stack development experience",
+                    "Frontend framework proficiency",
+                    "Database design skills",
+                    "Client interaction experience",
+                    "Project delivery experience"
+                ]
+            },
+            {
+                "id": 8,
+                "title": "Python Automation Engineer",
+                "company": "QualityFirst Testing",
+                "experience": "2-4 years",
+                "location": "Noida",
+                "skills": [
+                    "Python", "Selenium", "Pytest", "Robot Framework", "API Testing", 
+                    "Jenkins", "TestRail", "Git", "Linux", "SQL"
+                ],
+                "soft_skills": [
+                    "Attention to Detail", "Analytical Thinking", "Patience", 
+                    "Documentation", "Quality Focus"
+                ],
+                "tools": [
+                    "Selenium IDE", "Postman", "JIRA", "TestRail", "Jenkins"
+                ],
+                "description": "Build comprehensive test automation frameworks using Python. Ensure software quality through automated testing strategies.",
+                "requirements": [
+                    "Test automation experience",
+                    "Web and API testing knowledge",
+                    "Framework development skills",
+                    "CI/CD integration experience",
+                    "Quality assurance background"
+                ]
+            },
+            {
+                "id": 9,
+                "title": "Python Research Engineer",
+                "company": "Academic Research Institute",
+                "experience": "4-8 years",
+                "location": "Kolkata",
+                "skills": [
+                    "Python", "Research", "Statistics", "Data Analysis", "Scientific Computing", 
+                    "NumPy", "SciPy", "Matplotlib", "LaTeX", "R"
+                ],
+                "soft_skills": [
+                    "Research Methodology", "Critical Thinking", "Academic Writing", 
+                    "Presentation Skills", "Peer Collaboration"
+                ],
+                "tools": [
+                    "Jupyter", "LaTeX", "MATLAB", "R Studio", "Reference Managers"
+                ],
+                "description": "Conduct computational research using Python for scientific applications. Publish findings in peer-reviewed journals.",
+                "requirements": [
+                    "PhD in relevant field",
+                    "Research publication record",
+                    "Scientific programming experience",
+                    "Statistical analysis expertise",
+                    "Grant writing experience"
+                ]
+            },
+            {
+                "id": 10,
+                "title": "Python Security Engineer",
+                "company": "CyberSecure Systems",
+                "experience": "4-7 years",
+                "location": "Gurgaon",
+                "skills": [
+                    "Python", "Cybersecurity", "Penetration Testing", "Cryptography", 
+                    "Network Security", "OWASP", "Linux", "Bash", "SQL Injection"
+                ],
+                "soft_skills": [
+                    "Security Mindset", "Ethical Hacking", "Risk Assessment", 
+                    "Incident Response", "Compliance Awareness"
+                ],
+                "tools": [
+                    "Burp Suite", "Metasploit", "Wireshark", "Nmap", "OWASP ZAP"
+                ],
+                "description": "Develop security tools and conduct vulnerability assessments using Python. Protect organizational assets from cyber threats.",
+                "requirements": [
+                    "Cybersecurity experience",
+                    "Penetration testing skills",
+                    "Security tool development",
+                    "Compliance knowledge",
+                    "Incident response experience"
+                ]
+            }
+        ]
+        return jobs
+    
+    def calculate_skill_match(self, resume_skills: List[str], job_skills: List[str]) -> float:
+        """Calculate skill match percentage"""
+        if not resume_skills or not job_skills:
             return 0.0
         
-        cv_skills_lower = [skill.lower() for skill in cv_skills]
-        job_skills_lower = [skill.lower() for skill in job_skills]
+        resume_skills_lower = [skill.lower().strip() for skill in resume_skills]
+        job_skills_lower = [skill.lower().strip() for skill in job_skills]
         
-        matches = 0
-        for job_skill in job_skills_lower:
-            # Exact match
-            if job_skill in cv_skills_lower:
-                matches += 1
-            else:
-                # Fuzzy match
-                best_match = process.extractOne(job_skill, cv_skills_lower)
-                if best_match and best_match[1] > 80:  # 80% similarity threshold
-                    matches += 0.8
+        matches = len(set(resume_skills_lower) & set(job_skills_lower))
+        total_job_skills = len(job_skills_lower)
         
-        return matches / len(job_skills) if job_skills else 0.0
+        return (matches / total_job_skills) * 100 if total_job_skills > 0 else 0.0
     
-    def calculate_text_similarity(self, cv_text: str, job_text: str) -> float:
-        """Calculate text similarity using TF-IDF"""
+    def calculate_semantic_similarity(self, resume_text: str, job_description: str) -> float:
+        """Calculate semantic similarity using sentence transformers"""
         try:
-            # Combine texts for vectorization
-            texts = [cv_text, job_text]
-            tfidf_matrix = self.vectorizer.fit_transform(texts)
-            
-            # Calculate cosine similarity
-            similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
-            return similarity
+            embeddings = self.sentence_model.encode([resume_text, job_description])
+            similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+            return float(similarity * 100)
         except Exception as e:
-            logger.error(f"Text similarity calculation error: {e}")
+            logger.error(f"Semantic similarity calculation failed: {e}")
             return 0.0
     
-    def match_jobs(self, cv_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Match CV against all job descriptions"""
+    def match_resume_to_jobs(self, resume_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Match resume to all job descriptions and rank them"""
         matches = []
         
-        cv_technical_skills = cv_data.get('skills', {}).get('technical_skills', [])
-        cv_soft_skills = cv_data.get('skills', {}).get('soft_skills', [])
-        cv_text = cv_data.get('text', '')
+        # Combine all resume text for semantic analysis
+        resume_text = f"""
+        Skills: {', '.join(resume_data.get('skills', {}).get('technical', []))}
+        Soft Skills: {', '.join(resume_data.get('skills', {}).get('soft', []))}
+        Tools: {', '.join(resume_data.get('tools_technologies', []))}
+        Experience: {resume_data.get('experience_years', 0)} years
+        """
         
         for job in self.job_descriptions:
-            # Calculate various similarity scores
-            technical_score = self.calculate_skill_match_score(cv_technical_skills, job['skills'])
-            soft_skill_score = self.calculate_skill_match_score(cv_soft_skills, job['soft_skills'])
-            tools_score = self.calculate_skill_match_score(cv_technical_skills, job['tools'])
+            # Calculate different match scores
+            technical_score = self.calculate_skill_match(
+                resume_data.get('skills', {}).get('technical', []),
+                job['skills']
+            )
             
-            # Create job description text for similarity calculation
-            job_text = f"{' '.join(job['skills'])} {' '.join(job['requirements'])} {' '.join(job['responsibilities'])}"
-            text_similarity = self.calculate_text_similarity(cv_text, job_text)
+            soft_skills_score = self.calculate_skill_match(
+                resume_data.get('skills', {}).get('soft', []),
+                job['soft_skills']
+            )
             
-            # Calculate weighted overall score
+            tools_score = self.calculate_skill_match(
+                resume_data.get('tools_technologies', []),
+                job['tools']
+            )
+            
+            # Semantic similarity
+            job_text = f"{job['description']} {' '.join(job['requirements'])}"
+            semantic_score = self.calculate_semantic_similarity(resume_text, job_text)
+            
+            # Experience match
+            resume_exp = resume_data.get('experience_years', 0)
+            job_exp_range = job['experience']
+            exp_score = self.calculate_experience_match(resume_exp, job_exp_range)
+            
+            # Overall match score (weighted average)
             overall_score = (
-                technical_score * 0.4 +
-                soft_skill_score * 0.2 +
-                tools_score * 0.2 +
-                text_similarity * 0.2
+                technical_score * 0.35 +
+                semantic_score * 0.25 +
+                soft_skills_score * 0.15 +
+                tools_score * 0.15 +
+                exp_score * 0.10
             )
             
             match_result = {
@@ -647,353 +719,425 @@ class JobMatcher:
                 "job_title": job['title'],
                 "company": job['company'],
                 "location": job['location'],
-                "experience": job['experience'],
-                "overall_score": round(overall_score * 100, 2),
-                "technical_skill_match": round(technical_score * 100, 2),
-                "soft_skill_match": round(soft_skill_score * 100, 2),
-                "tools_match": round(tools_score * 100, 2),
-                "text_similarity": round(text_similarity * 100, 2),
-                "matched_skills": list(set(cv_technical_skills) & set([skill.lower() for skill in job['skills']])),
-                "missing_skills": list(set([skill.lower() for skill in job['skills']]) - set([skill.lower() for skill in cv_technical_skills]))
+                "overall_match_score": round(overall_score, 2),
+                "technical_skills_match": round(technical_score, 2),
+                "soft_skills_match": round(soft_skills_score, 2),
+                "tools_match": round(tools_score, 2),
+                "semantic_similarity": round(semantic_score, 2),
+                "experience_match": round(exp_score, 2),
+                "matched_skills": list(set(resume_data.get('skills', {}).get('technical', [])) & 
+                                     set([s.lower() for s in job['skills']])),
+                "missing_skills": [skill for skill in job['skills'] 
+                                 if skill.lower() not in [s.lower() for s in resume_data.get('skills', {}).get('technical', [])]],
+                "job_description": job['description']
             }
             
             matches.append(match_result)
         
-        # Sort by overall score
-        matches.sort(key=lambda x: x['overall_score'], reverse=True)
+        # Sort by overall match score
+        matches.sort(key=lambda x: x['overall_match_score'], reverse=True)
+        
         return matches
-
-class OllamaClient:
-    """Client for Ollama local LLM"""
     
-    def __init__(self, base_url: str = "http://localhost:11434"):
-        self.base_url = base_url
-        self.model = "llama3.2:3b"
-    
-    def generate_text(self, prompt: str) -> str:
-        """Generate text using Ollama"""
+    def calculate_experience_match(self, resume_exp: int, job_exp_range: str) -> float:
+        """Calculate experience match score"""
         try:
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False
-                },
-                timeout=30
-            )
+            # Parse job experience range
+            exp_parts = job_exp_range.lower().replace('years', '').replace('year', '').strip()
             
-            if response.status_code == 200:
-                return response.json().get('response', '')
+            if '-' in exp_parts:
+                min_exp, max_exp = map(int, exp_parts.split('-'))
+                
+                if min_exp <= resume_exp <= max_exp:
+                    return 100.0
+                elif resume_exp < min_exp:
+                    # Under-qualified
+                    diff = min_exp - resume_exp
+                    return max(0, 100 - (diff * 20))
+                else:
+                    # Over-qualified
+                    diff = resume_exp - max_exp
+                    return max(50, 100 - (diff * 10))
             else:
-                logger.error(f"Ollama API error: {response.status_code}")
-                return ""
+                # Single number or "0-2", "3+" format
+                if '+' in exp_parts:
+                    min_exp = int(exp_parts.replace('+', ''))
+                    return 100.0 if resume_exp >= min_exp else max(0, 100 - (min_exp - resume_exp) * 20)
+                else:
+                    target_exp = int(exp_parts)
+                    diff = abs(resume_exp - target_exp)
+                    return max(0, 100 - (diff * 15))
+        
         except Exception as e:
-            logger.error(f"Ollama request error: {e}")
-            return ""
+            logger.error(f"Experience match calculation failed: {e}")
+            return 50.0  # Default neutral score
     
-    def enhance_cv_analysis(self, cv_text: str) -> str:
-        """Enhance CV analysis using LLM"""
-        prompt = f"""
-        Analyze the following CV/Resume text and provide insights:
-        
-        CV Text:
-        {cv_text}
-        
-        Please provide:
-        1. Key strengths of the candidate
-        2. Areas for improvement
-        3. Suitable job roles
-        4. Missing skills that are commonly required
-        5. Overall assessment
-        
-        Keep the response concise and professional.
-        """
-        
-        return self.generate_text(prompt)
-    
-    def generate_job_recommendations(self, cv_analysis: Dict[str, Any]) -> str:
-        """Generate personalized job recommendations"""
-        skills = cv_analysis.get('skills', {})
-        technical_skills = ', '.join(skills.get('technical_skills', []))
-        soft_skills = ', '.join(skills.get('soft_skills', []))
-        
-        prompt = f"""
-        Based on a candidate's profile with the following skills:
-        
-        Technical Skills: {technical_skills}
-        Soft Skills: {soft_skills}
-        
-        Provide personalized career advice including:
-        1. Best matching job roles
-        2. Skills to develop
-        3. Career progression path
-        4. Industry recommendations
-        
-        Keep it concise and actionable.
-        """
-        
-        return self.generate_text(prompt)
+    def get_top_matches(self, resume_data: Dict[str, Any], top_n: int = 5) -> List[Dict[str, Any]]:
+        """Get top N job matches"""
+        matches = self.match_resume_to_jobs(resume_data)
+        return matches[:top_n]
 
 # Pydantic models for API
-class OCRResponse(BaseModel):
-    text: str
-    confidence_scores: Dict[str, float]
-    extracted_info: Dict[str, Any]
+class ResumeData(BaseModel):
+    personal_info: Dict[str, Any] = {}
+    skills: Dict[str, List[str]] = {"technical": [], "soft": []}
+    experience_years: int = 0
+    tools_technologies: List[str] = []
+    achievements: List[Dict[str, Any]] = []
 
 class JobMatchResponse(BaseModel):
-    matches: List[Dict[str, Any]]
-    total_jobs: int
-    best_match: Dict[str, Any]
+    job_id: int
+    job_title: str
+    company: str
+    location: str
+    overall_match_score: float
+    technical_skills_match: float
+    soft_skills_match: float
+    tools_match: float
+    semantic_similarity: float
+    experience_match: float
+    matched_skills: List[str]
+    missing_skills: List[str]
+    job_description: str
 
-class AnalysisResponse(BaseModel):
-    cv_analysis: Dict[str, Any]
-    job_matches: List[Dict[str, Any]]
-    llm_insights: str
-    recommendations: str
+class DocumentProcessResponse(BaseModel):
+    file_path: str
+    document_type: str
+    extracted_text: str
+    structured_data: Dict[str, Any]
+    confidence_score: float
+    error: Optional[str] = None
 
 # FastAPI Application
 app = FastAPI(
-    title="OCR Job Matching System",
-    description="Advanced OCR system with job matching and AI insights",
+    title="Advanced OCR & Job Matching System",
+    description="Process documents with OCR and match resumes to job descriptions",
     version="1.0.0"
 )
 
-# Global instances
-ocr_engine = OCREngine()
-text_processor = TextProcessor()
+# Initialize processors
+document_processor = DocumentProcessor()
 job_matcher = JobMatcher()
-ollama_client = OllamaClient()
 
-@app.post("/ocr/extract", response_model=OCRResponse)
-async def extract_text_from_image(
+@app.post("/process-document/", response_model=DocumentProcessResponse)
+async def process_document(
     file: UploadFile = File(...),
-    doc_type: str = Form(default=DocumentTypes.GENERAL)
+    document_type: str = "auto"
 ):
-    """Extract text from uploaded image using multiple OCR engines"""
+    """Process uploaded document using OCR"""
+    import tempfile
+    import shutil
+    
     try:
-        # Save uploaded file temporarily
-        temp_path = f"temp_{file.filename}"
-        with open(temp_path, "wb") as buffer:
+        # Create a temporary directory
+        temp_dir = tempfile.mkdtemp()
+        
+        # Create safe filename
+        safe_filename = "".join(c for c in file.filename if c.isalnum() or c in (' ', '.', '_')).rstrip()
+        temp_path = os.path.join(temp_dir, safe_filename)
+        
+        # Save uploaded file
+        with open(temp_path, "wb") as temp_file:
             content = await file.read()
-            buffer.write(content)
+            temp_file.write(content)
         
-        # Extract text using multiple OCR engines
-        ocr_results = ocr_engine.extract_text_multi_engine(temp_path, doc_type)
+        # Verify file exists
+        if not os.path.exists(temp_path):
+            raise FileNotFoundError(f"Failed to save file at {temp_path}")
         
-        # Process extracted text
-        extracted_info = {}
-        if ocr_results['best_result']:
-            skills = text_processor.extract_skills(ocr_results['best_result'])
-            experience = text_processor.extract_experience(ocr_results['best_result'])
-            education = text_processor.extract_education(ocr_results['best_result'])
-            contact = text_processor.extract_contact_info(ocr_results['best_result'])
-            achievements = text_processor.extract_achievements(ocr_results['best_result'])
+        print(f"Processing file: {temp_path}, Size: {os.path.getsize(temp_path)} bytes")
+        
+        # Process document
+        result = document_processor.process_document(temp_path, document_type)
+        
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return DocumentProcessResponse(**result)
+    
+    except Exception as e:
+        # Clean up on error
+        try:
+            if 'temp_dir' in locals():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
+        
+        print(f"Error processing document: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
+
+@app.post("/match-jobs/", response_model=List[JobMatchResponse])
+async def match_jobs(resume_data: ResumeData, top_n: int = 5):
+    """Match resume data to job descriptions"""
+    try:
+        matches = job_matcher.get_top_matches(resume_data.dict(), top_n)
+        return [JobMatchResponse(**match) for match in matches]
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Job matching failed: {str(e)}")
+
+@app.post("/process-and-match/")
+async def process_and_match(
+    file: UploadFile = File(...),
+    document_type: str = "resume",
+    top_n: int = 5
+):
+    """Process resume document and match to jobs in one step"""
+    import tempfile
+    import shutil
+    
+    try:
+        # Create a temporary directory
+        temp_dir = tempfile.mkdtemp()
+        
+        # Create safe filename
+        safe_filename = "".join(c for c in file.filename if c.isalnum() or c in (' ', '.', '_')).rstrip()
+        temp_path = os.path.join(temp_dir, safe_filename)
+        
+        # Save uploaded file
+        with open(temp_path, "wb") as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+        
+        # Verify file exists
+        if not os.path.exists(temp_path):
+            raise FileNotFoundError(f"Failed to save file at {temp_path}")
+        
+        print(f"Processing file: {temp_path}, Size: {os.path.getsize(temp_path)} bytes")
+        
+        # Process document
+        doc_result = document_processor.process_document(temp_path, document_type)
+        
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        # Extract resume data
+        if document_type in ["resume", "cv"] and doc_result.get("structured_data"):
+            resume_data = doc_result["structured_data"]
             
-            extracted_info = {
-                "skills": skills,
-                "experience": experience,
-                "education": education,
-                "contact": contact,
-                "achievements": achievements
+            # Match to jobs
+            matches = job_matcher.get_top_matches(resume_data, top_n)
+            
+            return {
+                "document_processing": doc_result,
+                "job_matches": matches,
+                "summary": {
+                    "total_jobs_analyzed": len(job_matcher.job_descriptions),
+                    "top_matches_returned": len(matches),
+                    "best_match_score": matches[0]["overall_match_score"] if matches else 0,
+                    "processing_confidence": doc_result.get("confidence_score", 0)
+                }
             }
-        
-        # Clean up temporary file
-        os.remove(temp_path)
-        
-        return OCRResponse(
-            text=ocr_results['best_result'],
-            confidence_scores=ocr_results['confidence_scores'],
-            extracted_info=extracted_info
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR processing error: {str(e)}")
-
-@app.post("/jobs/match", response_model=JobMatchResponse)
-async def match_jobs_with_cv(
-    file: UploadFile = File(...),
-    doc_type: str = Form(default=DocumentTypes.CV)
-):
-    """Match CV against available job descriptions"""
-    try:
-        # Save uploaded file temporarily
-        temp_path = f"temp_{file.filename}"
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # Extract text and information
-        ocr_results = ocr_engine.extract_text_multi_engine(temp_path, doc_type)
-        
-        cv_data = {
-            "text": ocr_results['best_result'],
-            "skills": text_processor.extract_skills(ocr_results['best_result']),
-            "experience": text_processor.extract_experience(ocr_results['best_result']),
-            "education": text_processor.extract_education(ocr_results['best_result'])
-        }
-        
-        # Match jobs
-        job_matches = job_matcher.match_jobs(cv_data)
-        
-        # Clean up
-        os.remove(temp_path)
-        
-        return JobMatchResponse(
-            matches=job_matches,
-            total_jobs=len(job_matches),
-            best_match=job_matches[0] if job_matches else {}
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Job matching error: {str(e)}")
-
-@app.post("/analysis/complete", response_model=AnalysisResponse)
-async def complete_cv_analysis(
-    file: UploadFile = File(...),
-    doc_type: str = Form(default=DocumentTypes.CV),
-    use_llm: bool = Form(default=True)
-):
-    """Complete CV analysis with OCR, job matching, and LLM insights"""
-    try:
-        # Save uploaded file temporarily
-        temp_path = f"temp_{file.filename}"
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # Extract text and information
-        ocr_results = ocr_engine.extract_text_multi_engine(temp_path, doc_type)
-        
-        # Process CV data
-        skills = text_processor.extract_skills(ocr_results['best_result'])
-        experience = text_processor.extract_experience(ocr_results['best_result'])
-        education = text_processor.extract_education(ocr_results['best_result'])
-        contact = text_processor.extract_contact_info(ocr_results['best_result'])
-        achievements = text_processor.extract_achievements(ocr_results['best_result'])
-        
-        cv_data = {
-            "text": ocr_results['best_result'],
-            "skills": skills,
-            "experience": experience,
-            "education": education,
-            "contact": contact,
-            "achievements": achievements
-        }
-        
-        # Match jobs
-        job_matches = job_matcher.match_jobs(cv_data)
-        
-        # Get LLM insights if requested
-        llm_insights = ""
-        recommendations = ""
-        
-        if use_llm:
-            llm_insights = ollama_client.enhance_cv_analysis(ocr_results['best_result'])
-            recommendations = ollama_client.generate_job_recommendations(cv_data)
-        
-        # Clean up
-        os.remove(temp_path)
-        
-        return AnalysisResponse(
-            cv_analysis=cv_data,
-            job_matches=job_matches[:5],  # Top 5 matches
-            llm_insights=llm_insights,
-            recommendations=recommendations
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
-
-@app.get("/jobs/all")
-async def get_all_jobs():
-    """Get all available job descriptions"""
-    return {"jobs": JobDescriptions.get_python_jobs()}
-
-@app.get("/jobs/{job_id}")
-async def get_job_by_id(job_id: int):
-    """Get specific job description by ID"""
-    jobs = JobDescriptions.get_python_jobs()
-    job = next((j for j in jobs if j['id'] == job_id), None)
-    
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    return {"job": job}
-
-@app.post("/skills/extract")
-async def extract_skills_from_text(text: str = Form(...)):
-    """Extract skills from provided text"""
-    skills = text_processor.extract_skills(text)
-    return {"skills": skills}
-
-@app.post("/llm/analyze")
-async def analyze_text_with_llm(
-    text: str = Form(...),
-    analysis_type: str = Form(default="general")
-):
-    """Analyze text using local LLM"""
-    try:
-        if analysis_type == "cv":
-            result = ollama_client.enhance_cv_analysis(text)
         else:
-            result = ollama_client.generate_text(f"Analyze the following text: {text}")
-        
-        return {"analysis": result}
+            return {
+                "document_processing": doc_result,
+                "error": "Document type not suitable for job matching or processing failed"
+            }
+    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM analysis error: {str(e)}")
+        # Clean up on error
+        try:
+            if 'temp_dir' in locals():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
+        
+        print(f"Error in process and match: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Process and match failed: {str(e)}")
+
+@app.get("/job-descriptions/")
+async def get_job_descriptions():
+    """Get all available job descriptions"""
+    return {"jobs": job_matcher.job_descriptions}
+
+@app.get("/job-descriptions/{job_id}")
+async def get_job_description(job_id: int):
+    """Get specific job description"""
+    job = next((job for job in job_matcher.job_descriptions if job["id"] == job_id), None)
+    if job:
+        return job
+    else:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+@app.post("/analyze-skill-gap/")
+async def analyze_skill_gap(resume_data: ResumeData, job_id: int):
+    """Analyze skill gap between resume and specific job"""
+    try:
+        job = next((job for job in job_matcher.job_descriptions if job["id"] == job_id), None)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        resume_skills = resume_data.skills.get("technical", [])
+        job_skills = job["skills"]
+        
+        matched_skills = list(set([s.lower() for s in resume_skills]) & set([s.lower() for s in job_skills]))
+        missing_skills = [skill for skill in job_skills if skill.lower() not in [s.lower() for s in resume_skills]]
+        extra_skills = [skill for skill in resume_skills if skill.lower() not in [s.lower() for s in job_skills]]
+        
+        skill_gap_analysis = {
+            "job_title": job["title"],
+            "company": job["company"],
+            "total_required_skills": len(job_skills),
+            "matched_skills": len(matched_skills),
+            "missing_skills_count": len(missing_skills),
+            "match_percentage": (len(matched_skills) / len(job_skills)) * 100 if job_skills else 0,
+            "matched_skills_list": matched_skills,
+            "missing_skills_list": missing_skills,
+            "additional_skills": extra_skills,
+            "recommendations": {
+                "priority_skills_to_learn": missing_skills[:3],  # Top 3 missing skills
+                "suggested_learning_path": [
+                    f"Focus on {skill} - high demand in {job['title']} roles" 
+                    for skill in missing_skills[:3]
+                ],
+                "strengths": matched_skills,
+                "readiness_level": "Ready" if len(matched_skills) / len(job_skills) > 0.7 else "Needs Development"
+            }
+        }
+        
+        return skill_gap_analysis
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Skill gap analysis failed: {str(e)}")
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "name": "Advanced OCR & Job Matching System",
+        "version": "1.0.0",
+        "description": "Process documents with OCR and match resumes to job descriptions",
+        "endpoints": {
+            "process_document": "/process-document/",
+            "match_jobs": "/match-jobs/",
+            "process_and_match": "/process-and-match/",
+            "job_descriptions": "/job-descriptions/",
+            "skill_gap_analysis": "/analyze-skill-gap/",
+            "docs": "/docs",
+            "redoc": "/redoc"
+        },
+        "supported_document_types": [
+            "resume", "cv", "invoice", "marksheet", "cheque", "challan", "handwritten"
+        ],
+        "supported_file_formats": [
+            "PDF", "PNG", "JPG", "JPEG", "TIFF", "BMP"
+        ]
+    }
+
+@app.post("/debug-upload/")
+async def debug_upload(file: UploadFile = File(...)):
+    """Debug endpoint to test file upload without processing"""
+    import tempfile
+    import shutil
+    
+    try:
+        # Get file info
+        file_info = {
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "size": 0
+        }
+        
+        # Create temporary directory
+        temp_dir = tempfile.mkdtemp()
+        print(f"Created temp directory: {temp_dir}")
+        
+        # Create safe filename
+        safe_filename = "".join(c for c in file.filename if c.isalnum() or c in (' ', '.', '_')).rstrip()
+        temp_path = os.path.join(temp_dir, safe_filename)
+        
+        # Read and save file
+        content = await file.read()
+        file_info["size"] = len(content)
+        
+        with open(temp_path, "wb") as temp_file:
+            temp_file.write(content)
+        
+        # Verify file
+        if os.path.exists(temp_path):
+            actual_size = os.path.getsize(temp_path)
+            file_info["saved_successfully"] = True
+            file_info["saved_size"] = actual_size
+            file_info["temp_path"] = temp_path
+        else:
+            file_info["saved_successfully"] = False
+            file_info["error"] = "File not found after saving"
+        
+        # Clean up
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return {
+            "status": "success",
+            "file_info": file_info,
+            "temp_dir_used": temp_dir,
+            "python_temp_dir": tempfile.gettempdir(),
+            "current_working_dir": os.getcwd()
+        }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "python_temp_dir": tempfile.gettempdir(),
+            "current_working_dir": os.getcwd()
+        }
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "ocr_engines": ["EasyOCR", "PaddleOCR", "TrOCR"],
-        "supported_documents": [
-            DocumentTypes.RESUME,
-            DocumentTypes.CV,
-            DocumentTypes.MARKSHEET,
-            DocumentTypes.INVOICE,
-            DocumentTypes.CHEQUE,
-            DocumentTypes.CHALLAN,
-            DocumentTypes.HANDWRITTEN
-        ],
-        "llm_model": "llama3.2:3b"
+        "timestamp": datetime.now().isoformat(),
+        "models_loaded": {
+            "trocr_printed": bool(document_processor.trocr_model),
+            "trocr_handwritten": bool(document_processor.trocr_hw_model),
+            "sentence_transformer": bool(job_matcher.sentence_model),
+            "ner_pipeline": bool(document_processor.ner_pipeline)
+        }
     }
 
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "OCR Job Matching System API",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "health": "/health"
+# Example usage and testing functions
+def test_system():
+    """Test the OCR and job matching system"""
+    print("Testing OCR & Job Matching System...")
+    
+    # Test job matching with sample resume data
+    sample_resume = {
+        "personal_info": {
+            "email": "john.doe@email.com",
+            "phone": "+91-9876543210"
+        },
+        "skills": {
+            "technical": ["Python", "Django", "PostgreSQL", "Docker", "AWS", "Git"],
+            "soft": ["Team Leadership", "Problem Solving", "Communication"]
+        },
+        "experience_years": 5,
+        "tools_technologies": ["PyCharm", "Jupyter", "Postman", "Jenkins"],
+        "achievements": [
+            {"title": "Employee of the Year", "year": "2023", "issued_by": "TechCorp"}
+        ]
     }
-
-# Error handlers
-@app.exception_handler(404)
-async def not_found_handler(request, exc):
-    return JSONResponse(
-        status_code=404,
-        content={"message": "Endpoint not found"}
-    )
-
-@app.exception_handler(500)
-async def server_error_handler(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"message": "Internal server error"}
-    )
+    
+    matcher = JobMatcher()
+    matches = matcher.get_top_matches(sample_resume, 3)
+    
+    print(f"\nTop 3 Job Matches for Sample Resume:")
+    for i, match in enumerate(matches, 1):
+        print(f"\n{i}. {match['job_title']} at {match['company']}")
+        print(f"   Overall Match: {match['overall_match_score']:.1f}%")
+        print(f"   Technical Skills: {match['technical_skills_match']:.1f}%")
+        print(f"   Location: {match['location']}")
+        print(f"   Matched Skills: {match['matched_skills']}")
+        print(f"   Missing Skills: {match['missing_skills'][:3]}")  # Show first 3
 
 if __name__ == "__main__":
-    print("Starting OCR Job Matching System...")
-    print("Make sure to install required dependencies:")
-    print("pip install fastapi uvicorn easyocr paddlepaddle paddleocr transformers torch")
-    print("pip install scikit-learn spacy fuzzywuzzy python-levenshtein pillow opencv-python")
-    print("python -m spacy download en_core_web_sm")
-    print("Install Ollama and run: ollama pull llama3.2:3b")
-    print("\nStarting server on http://localhost:8000")
-    print("API Documentation: http://localhost:8000/docs")
+    # Test the system
+    test_system()
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Run the FastAPI server
+    print("\nStarting FastAPI server...")
+    print("Access Swagger UI at: http://localhost:8000/docs")
+    print("Access ReDoc at: http://localhost:8000/redoc")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
